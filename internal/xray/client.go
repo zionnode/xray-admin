@@ -1,121 +1,170 @@
-package xray
+package main
 
 import (
-	"context"
+	"encoding/csv"
+	"flag"
 	"fmt"
+	"log"
+	"os"
 	"strings"
 	"time"
 
-	command "github.com/xtls/xray-core/app/proxyman/command"
-	"github.com/xtls/xray-core/common/protocol"
-	"github.com/xtls/xray-core/common/serial"
-	"github.com/xtls/xray-core/proxy/vless"
-	"github.com/xtls/xray-core/proxy/vmess"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/status"
+	"example.com/xray-admin/internal/batch"
+	"example.com/xray-admin/internal/xray"
 )
 
-type Client struct {
-	cc      *grpc.ClientConn
-	api     command.HandlerServiceClient
-	Tags    []string
-	Timeout time.Duration
+func main() {
+	if len(os.Args) < 2 {
+		usage()
+		return
+	}
+	switch os.Args[1] {
+	case "add-vless":
+		addVLESS()
+	case "add-vmess":
+		addVMess()
+	case "del":
+		delUser()
+	case "bulk-add":
+		bulkAdd()
+	default:
+		usage()
+	}
 }
 
-func NewClient(addr string, tags []string, timeout time.Duration) (*Client, error) {
-	cc, err := grpc.Dial(addr,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithBlock(),
-		grpc.WithIdleTimeout(2*time.Minute),
-	)
+func usage() {
+	fmt.Println(`xrayctl - Xray gRPC 管理工具
+
+子命令:
+  add-vless   添加 VLESS 用户到指定 inbound(们)
+  add-vmess   添加 VMess 用户到指定 inbound(们)
+  del         按 email 删除用户（会对所有指定 inbound 同步执行）
+  bulk-add    批量添加（CSV）
+
+示例:
+  xrayctl add-vless -addr 127.0.0.1:1090 -tags "in-1,in-2" -email a@b -uuid <uuid> -flow ""
+  xrayctl del -addr 127.0.0.1:1090 -tags "in-1" -email a@b
+  xrayctl bulk-add -addr 127.0.0.1:1090 -tags "in-1,in-2" -file assets/users.example.csv -concurrency 64
+`)
+}
+
+func mustClient(addr string, tags []string, timeout time.Duration) *xray.Client {
+	cli, err := xray.NewClient(addr, tags, timeout)
 	if err != nil {
-		return nil, err
+		log.Fatalf("dial: %v", err)
 	}
-	return &Client{
-		cc:      cc,
-		api:     command.NewHandlerServiceClient(cc),
-		Tags:    tags,
-		Timeout: timeout,
-	}, nil
+	return cli
 }
 
-func (c *Client) Close() { _ = c.cc.Close() }
-
-func (c *Client) CheckInbound(tag string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), c.Timeout)
-	defer cancel()
-	_, err := c.api.GetInbound(ctx, &command.GetInboundRequest{Tag: tag})
-	return err
-}
-
-func (c *Client) AddVLESS(email, uuid string, level uint32, flow string) error {
-	u := &protocol.User{
-		Email: email,
-		Level: level,
-		Account: serial.ToTypedMessage(&vless.Account{
-			Id:   uuid,
-			Flow: flow,
-		}),
-	}
-	return c.addUserAll(u)
-}
-
-func (c *Client) AddVMess(email, uuid string, level uint32) error {
-	u := &protocol.User{
-		Email: email,
-		Level: level,
-		Account: serial.ToTypedMessage(&vmess.Account{
-			Id: uuid,
-		}),
-	}
-	return c.addUserAll(u)
-}
-
-func (c *Client) addUserAll(u *protocol.User) error {
-	op := &command.AddUserOperation{User: u}
-	typed := serial.ToTypedMessage(op)
-	for _, tag := range c.Tags {
-		if err := c.alter(tag, typed); err != nil {
-			// 已存在则忽略
-			if alreadyExists(err) {
-				continue
-			}
-			return fmt.Errorf("tag=%s: %w", tag, err)
+func parseTags(s string) []string {
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if q := strings.TrimSpace(p); q != "" {
+			out = append(out, q)
 		}
 	}
-	return nil
+	return out
 }
 
-func (c *Client) Remove(email string) error {
-	op := &command.RemoveUserOperation{Email: email}
-	typed := serial.ToTypedMessage(op)
-	for _, tag := range c.Tags {
-		if err := c.alter(tag, typed); err != nil {
-			return fmt.Errorf("tag=%s: %w", tag, err)
-		}
+func addVLESS() {
+	fs := flag.NewFlagSet("add-vless", flag.ExitOnError)
+	addr := fs.String("addr", "127.0.0.1:1090", "Xray gRPC 地址")
+	tagsS := fs.String("tags", "", "逗号分隔的 inbound tags（必填，可多个）")
+	email := fs.String("email", "", "用户 email")
+	uuid := fs.String("uuid", "", "VLESS UUID")
+	level := fs.Uint("level", 0, "level")
+	flow := fs.String("flow", "", "VLESS flow（普通 VLESS 留空）")
+	timeout := fs.Duration("timeout", 8*time.Second, "RPC 超时")
+	_ = fs.Parse(os.Args[2:])
+	if *tagsS == "" || *email == "" || *uuid == "" {
+		log.Fatal("缺少 -tags / -email / -uuid")
 	}
-	return nil
+	cli := mustClient(*addr, parseTags(*tagsS), *timeout)
+	defer cli.Close()
+	if err := cli.AddVLESS(*email, *uuid, uint32(*level), *flow); err != nil {
+		log.Fatalf("添加失败: %v", err)
+	}
+	fmt.Println("OK")
 }
 
-func (c *Client) alter(tag string, op *serial.TypedMessage) error {
-	ctx, cancel := context.WithTimeout(context.Background(), c.Timeout)
-	defer cancel()
-	_, err := c.api.AlterInbound(ctx, &command.AlterInboundRequest{
-		Tag:       tag,
-		Operation: op,
-	})
-	return err
+func addVMess() {
+	fs := flag.NewFlagSet("add-vmess", flag.ExitOnError)
+	addr := fs.String("addr", "127.0.0.1:1090", "Xray gRPC 地址")
+	tagsS := fs.String("tags", "", "逗号分隔的 inbound tags（必填，可多个）")
+	email := fs.String("email", "", "用户 email")
+	uuid := fs.String("uuid", "", "VMess UUID")
+	level := fs.Uint("level", 0, "level")
+	timeout := fs.Duration("timeout", 8*time.Second, "RPC 超时")
+	_ = fs.Parse(os.Args[2:])
+	if *tagsS == "" || *email == "" || *uuid == "" {
+		log.Fatal("缺少 -tags / -email / -uuid")
+	}
+	cli := mustClient(*addr, parseTags(*tagsS), *timeout)
+	defer cli.Close()
+	if err := cli.AddVMess(*email, *uuid, uint32(*level)); err != nil {
+		log.Fatalf("添加失败: %v", err)
+	}
+	fmt.Println("OK")
 }
 
-func alreadyExists(err error) bool {
-	if err == nil {
-		return false
+func delUser() {
+	fs := flag.NewFlagSet("del", flag.ExitOnError)
+	addr := fs.String("addr", "127.0.0.1:1090", "Xray gRPC 地址")
+	tagsS := fs.String("tags", "", "逗号分隔的 inbound tags（必填，可多个）")
+	email := fs.String("email", "", "用户 email（作为删除键）")
+	timeout := fs.Duration("timeout", 8*time.Second, "RPC 超时")
+	_ = fs.Parse(os.Args[2:])
+	if *tagsS == "" || *email == "" {
+		log.Fatal("缺少 -tags / -email")
 	}
-	if st, ok := status.FromError(err); ok {
-		msg := strings.ToLower(st.Message())
-		return strings.Contains(msg, "already") || strings.Contains(msg, "exists")
+	cli := mustClient(*addr, parseTags(*tagsS), *timeout)
+	defer cli.Close()
+	if err := cli.Remove(*email); err != nil {
+		log.Fatalf("删除失败: %v", err)
 	}
-	return strings.Contains(strings.ToLower(err.Error()), "already") ||
-		strings.Contains(strings.ToLower(err.Error()), "exists")
+	fmt.Println("OK")
+}
+
+func bulkAdd() {
+	fs := flag.NewFlagSet("bulk-add", flag.ExitOnError)
+	addr := fs.String("addr", "127.0.0.1:1090", "Xray gRPC 地址")
+	tagsS := fs.String("tags", "", "逗号分隔的 inbound tags（必填，可多个）")
+	file := fs.String("file", "assets/users.example.csv", "CSV 文件路径")
+	proto := fs.String("proto", "vless", "默认协议 vless|vmess（CSV 未写时使用）")
+	level := fs.Uint("level", 0, "默认 level（CSV 未写时使用）")
+	flow := fs.String("flow", "", "默认 VLESS flow（CSV 未写时使用）")
+	concurrency := fs.Int("concurrency", 64, "并发数")
+	retries := fs.Int("retries", 3, "重试次数")
+	timeout := fs.Duration("timeout", 8*time.Second, "RPC 超时")
+	_ = fs.Parse(os.Args[2:])
+	if *tagsS == "" {
+		log.Fatal("缺少 -tags")
+	}
+	tags := parseTags(*tagsS)
+
+	f, err := os.Open(*file)
+	if err != nil {
+		log.Fatalf("open csv: %v", err)
+	}
+	defer f.Close()
+	r := csv.NewReader(f)
+	r.FieldsPerRecord = -1
+
+	rows, err := batch.LoadRows(r, *proto, uint32(*level), *flow)
+	if err != nil {
+		log.Fatalf("parse csv: %v", err)
+	}
+	if len(rows) == 0 {
+		log.Fatal("CSV 无任务")
+	}
+
+	cli := mustClient(*addr, tags, *timeout)
+	defer cli.Close()
+
+	ok, fail := batch.RunBulk(cli, rows, *concurrency, *retries)
+	log.Printf("BULK DONE: ok=%d failed=%d total=%d", ok, fail, len(rows))
+	if fail > 0 {
+		os.Exit(1)
+	}
 }
