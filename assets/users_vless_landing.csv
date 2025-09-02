@@ -1,5 +1,5 @@
 email,uuid,proto,level,flow
-user0001@example.com,b6560b08-4bb7-40ae-8461-2c76a0e492f2,vless,0,
+u1234567,b6560b08-4bb7-40ae-8461-2c76a0e492f2,vless,0,
 user0002@example.com,732f949f-1f2e-4bcb-aee9-4b3f6cad0790,vless,0,
 user0003@example.com,a63a810c-6b16-4b76-869b-ba8c609ef731,vless,0,
 user0004@example.com,aac89922-aa14-4eeb-8cda-0039d4a1f0a4,vless,0,
