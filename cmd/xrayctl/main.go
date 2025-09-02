@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"example.com/xray-admin/internal/batch"
-	"example.com/xray-admin/internal/xray"
+	"github.com/zionnode/xray-admin/internal/batch"
+	"github.com/zionnode/xray-admin/internal/xray"
 )
 
 func main() {
@@ -25,8 +25,6 @@ func main() {
 		addVMess()
 	case "del":
 		delUser()
-	case "check":
-		checkInbound()
 	case "bulk-add":
 		bulkAdd()
 	default:
@@ -38,16 +36,14 @@ func usage() {
 	fmt.Println(`xrayctl - Xray gRPC 管理工具
 
 子命令:
-  add-vless   添加 VLESS 用户到指定 inbound
-  add-vmess   添加 VMess 用户到指定 inbound
-  del         按 email 删除用户
-  check       检查 inbound 是否存在
+  add-vless   添加 VLESS 用户到指定 inbound(们)
+  add-vmess   添加 VMess 用户到指定 inbound(们)
+  del         按 email 删除用户（会对所有指定 inbound 同步执行）
   bulk-add    批量添加（CSV）
 
 示例:
-  xrayctl add-vless -addr 127.0.0.1:1090 -tags "in-1,in-2" -email a@b -uuid <uuid> -flow xtls-rprx-vision
+  xrayctl add-vless -addr 127.0.0.1:1090 -tags "in-1,in-2" -email a@b -uuid <uuid> -flow ""
   xrayctl del -addr 127.0.0.1:1090 -tags "in-1" -email a@b
-  xrayctl check -addr 127.0.0.1:1090 -tag in-1
   xrayctl bulk-add -addr 127.0.0.1:1090 -tags "in-1,in-2" -file assets/users.example.csv -concurrency 64
 `)
 }
@@ -78,7 +74,7 @@ func addVLESS() {
 	email := fs.String("email", "", "用户 email")
 	uuid := fs.String("uuid", "", "VLESS UUID")
 	level := fs.Uint("level", 0, "level")
-	flow := fs.String("flow", "", "VLESS flow（如 xtls-rprx-vision）")
+	flow := fs.String("flow", "", "VLESS flow（普通 VLESS 留空）")
 	timeout := fs.Duration("timeout", 8*time.Second, "RPC 超时")
 	_ = fs.Parse(os.Args[2:])
 	if *tagsS == "" || *email == "" || *uuid == "" {
@@ -130,23 +126,6 @@ func delUser() {
 	fmt.Println("OK")
 }
 
-func checkInbound() {
-	fs := flag.NewFlagSet("check", flag.ExitOnError)
-	addr := fs.String("addr", "127.0.0.1:1090", "Xray gRPC 地址")
-	tag := fs.String("tag", "", "inbound tag")
-	timeout := fs.Duration("timeout", 5*time.Second, "RPC 超时")
-	_ = fs.Parse(os.Args[2:])
-	if *tag == "" {
-		log.Fatal("缺少 -tag")
-	}
-	cli := mustClient(*addr, []string{*tag}, *timeout)
-	defer cli.Close()
-	if err := cli.CheckInbound(*tag); err != nil {
-		log.Fatalf("不可用: %v", err)
-	}
-	fmt.Println("OK: inbound 存在")
-}
-
 func bulkAdd() {
 	fs := flag.NewFlagSet("bulk-add", flag.ExitOnError)
 	addr := fs.String("addr", "127.0.0.1:1090", "Xray gRPC 地址")
@@ -164,7 +143,6 @@ func bulkAdd() {
 	}
 	tags := parseTags(*tagsS)
 
-	// 打开 CSV
 	f, err := os.Open(*file)
 	if err != nil {
 		log.Fatalf("open csv: %v", err)

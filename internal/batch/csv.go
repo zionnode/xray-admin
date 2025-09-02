@@ -9,7 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"example.com/xray-admin/internal/xray"
+	"github.com/zionnode/xray-admin/internal/xray"
 )
 
 type Row struct {
