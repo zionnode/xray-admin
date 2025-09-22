@@ -46,15 +46,16 @@ func (c *Client) Close() { _ = c.cc.Close() }
 
 // AddVLESS 在所有 inbound tag 上添加 VLESS 用户（普通 VLESS 时 flow 传 ""）
 func (c *Client) AddVLESS(email, uuid string, level uint32, flow string) error {
-	u := &protocol.User{
-		Email: email,
-		Level: level,
-		Account: serial.ToTypedMessage(&vless.Account{
-			Id:   uuid,
-			Flow: flow, // 非 Vision 留空
-		}),
-	}
-	return c.addUserAll(u)
+    acc := &vless.Account{ Id: uuid }
+    if strings.TrimSpace(flow) != "" {
+        acc.Flow = flow // 只有非空才设置
+    }
+    u := &protocol.User{
+        Email:   email,
+        Level:   level,
+        Account: serial.ToTypedMessage(acc),
+    }
+    return c.addUserAll(u)
 }
 
 // AddVMess 在所有 inbound tag 上添加 VMess 用户
