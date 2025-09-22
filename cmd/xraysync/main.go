@@ -12,7 +12,6 @@ import (
 )
 
 func main() {
-	// —— 基本配置（可用环境变量代替，这里用 flag 简洁暴露）——
 	apiURL   := flag.String("api", "https://zioncore.site/apiv2/nodes/server-clients/", "远端 API URL")
 	token    := flag.String("token", "", "固定鉴权 token（必填）")
 	publicID := flag.String("public-id", "", "该 Xray 服务器的 public_id（必填）")
@@ -26,6 +25,8 @@ func main() {
 	dbPath := flag.String("db", "data/users.json", "本地清单 DB 路径（JSON）")
 	snapDir := flag.String("snap", "data/snapshots", "快照目录")
 	interval := flag.Duration("interval", 0, "轮询间隔（>0 则循环同步；例如 1m）")
+
+	concurrency := flag.Int("concurrency", 64, "并发 worker 数（Add/Remove/Update），推荐 64~128")
 
 	flag.Parse()
 	if *token == "" || *publicID == "" {
@@ -48,8 +49,10 @@ func main() {
 			log.Printf("no tags returned; skip")
 			return
 		}
-		log.Printf("sync to Xray(%s) tags=%v users=%d mode=%s", *xrayAddr, res.Tags, len(res.Users), *mode)
-		sum, err := syncer.Sync(*xrayAddr, res.Tags, res.Users, *mode, db, *snapDir, res.Raw)
+		log.Printf("sync to Xray(%s) tags=%v users=%d mode=%s concurrency=%d",
+			*xrayAddr, res.Tags, len(res.Users), *mode, *concurrency)
+
+		sum, err := syncer.Sync(*xrayAddr, res.Tags, res.Users, *mode, *concurrency, db, *snapDir, res.Raw)
 		if err != nil {
 			log.Printf("sync error: %v", err)
 			return
