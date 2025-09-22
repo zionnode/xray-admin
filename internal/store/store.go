@@ -84,3 +84,15 @@ func (d *DB) Snapshot() map[string]User {
 	}
 	return out
 }
+
+// ReplaceAll 用 newUsers 替换整库（一次性写盘），用于批量同步收敛后提交。
+func (d *DB) ReplaceAll(newUsers map[string]User) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	d.Users = make(map[string]User, len(newUsers))
+	for k, v := range newUsers {
+		d.Users[k] = v
+	}
+	return d.save()
+}

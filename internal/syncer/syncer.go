@@ -23,7 +23,8 @@ type Summary struct {
 }
 
 // Sync 把 target 用户集声明式同步到 Xray（按 email=UID 为键）；成功后更新本地 DB 与快照。
-// concurrency 为并发 worker 数（建议 64~128）。mode: "replace"（含删除）或 "upsert"（不删）。
+// 与旧版不同：同步过程中仅更新内存态 state，完毕后一次性 db.ReplaceAll(state) 落盘。
+// concurrency 为并发 worker 数；mode: "replace"（含删除）或 "upsert"（不删）。
 func Sync(apiAddr string, tags []string, target map[string]store.User, mode string,
 	concurrency int, db *store.DB, snapDir string, rawJSON []byte) (Summary, error) {
 
@@ -36,31 +37,37 @@ func Sync(apiAddr string, tags []string, target map[string]store.User, mode stri
 	_ = os.MkdirAll(snapDir, 0o755)
 	currentJSON := filepath.Join(snapDir, "current.json")
 
+	// 1) 计算差异
 	prev := db.Snapshot()
 	adds, upds, dels := diff(prev, target, mode)
 
+	// 2) 连接 Xray
 	cli, err := xray.NewClient(apiAddr, tags, 8*time.Second)
 	if err != nil {
 		return Summary{}, err
 	}
 	defer cli.Close()
 
+	// 3) 准备“工作副本” state（内存态），成功的变更只改 state；最后一次性写盘
+	state := make(map[string]store.User, len(prev))
+	for k, v := range prev {
+		state[k] = v
+	}
+	var stateMu sync.Mutex
+
+	// 4) 并发执行
 	type job struct {
 		typ string       // "add" | "upd" | "del"
-		u   store.User   // 用于 add / del
-		old store.User   // upd: 旧值
-		new store.User   // upd: 新值
+		u   store.User   // add/del
+		old store.User   // upd: 旧
+		new store.User   // upd: 新
 	}
 	jobs := make(chan job, concurrency*2)
 
 	totalJobs := len(adds) + len(upds) + len(dels)
-	var processed int64
-	var okAdd int64
-	var okUpd int64
-	var okDel int64
-	var failed int64
+	var processed, okAdd, okUpd, okDel, failed int64
 
-	// 进度 ticker：每 1 秒打印一次当前进度
+	// 进度：每秒打印一次 & 每 100 条里程碑
 	stopProg := make(chan struct{})
 	go func() {
 		if totalJobs == 0 {
@@ -92,7 +99,9 @@ func Sync(apiAddr string, tags []string, target map[string]store.User, mode stri
 			case "add":
 				e = withRetry(3, func() error { return addUser(cli, j.u) })
 				if e == nil {
-					_ = db.Upsert(j.u)
+					stateMu.Lock()
+					state[j.u.UID] = j.u
+					stateMu.Unlock()
 					atomic.AddInt64(&okAdd, 1)
 				}
 			case "upd":
@@ -103,13 +112,17 @@ func Sync(apiAddr string, tags []string, target map[string]store.User, mode stri
 					return addUser(cli, j.new)
 				})
 				if e == nil {
-					_ = db.Upsert(j.new)
+					stateMu.Lock()
+					state[j.new.UID] = j.new
+					stateMu.Unlock()
 					atomic.AddInt64(&okUpd, 1)
 				}
 			case "del":
 				e = withRetry(3, func() error { return cli.Remove(j.u.Email) })
 				if e == nil {
-					_ = db.Delete(j.u.UID)
+					stateMu.Lock()
+					delete(state, j.u.UID)
+					stateMu.Unlock()
 					atomic.AddInt64(&okDel, 1)
 				}
 			}
@@ -117,7 +130,6 @@ func Sync(apiAddr string, tags []string, target map[string]store.User, mode stri
 				atomic.AddInt64(&failed, 1)
 			}
 
-			// 里程碑日志：每处理 100 条也打一次
 			n := atomic.AddInt64(&processed, 1)
 			if totalJobs > 0 && n%100 == 0 {
 				a := atomic.LoadInt64(&okAdd)
@@ -139,7 +151,7 @@ func Sync(apiAddr string, tags []string, target map[string]store.User, mode stri
 		}
 	}
 
-	// 投喂任务：先 add，再 upd（删后加），最后 del
+	// 投喂任务：先 add、再 upd（删后加）、最后 del
 	for _, u := range adds {
 		jobs <- job{typ: "add", u: u}
 	}
@@ -156,7 +168,12 @@ func Sync(apiAddr string, tags []string, target map[string]store.User, mode stri
 	wg.Wait()
 	close(stopProg)
 
-	// 写快照（即使有失败也记录原始输入，便于审计与重试）
+	// 5) 一次性落盘（用最终 state 替换整库）
+	if err := db.ReplaceAll(state); err != nil {
+		log.Printf("warning: write users.json failed: %v", err)
+	}
+
+	// 6) 写快照（原始输入）
 	now := time.Now().Unix()
 	wrap := map[string]any{"revision": now, "payload": json.RawMessage(rawJSON)}
 	b, _ := json.MarshalIndent(wrap, "", "  ")
@@ -164,7 +181,6 @@ func Sync(apiAddr string, tags []string, target map[string]store.User, mode stri
 	ts := time.Unix(now, 0).UTC().Format("20060102T150405Z")
 	_ = os.WriteFile(filepath.Join(snapDir, fmt.Sprintf("snapshot-%s.json", ts)), rawJSON, 0644)
 
-	// 汇总
 	sum := Summary{
 		Added:   int(atomic.LoadInt64(&okAdd)),
 		Updated: int(atomic.LoadInt64(&okUpd)),
