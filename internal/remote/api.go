@@ -11,20 +11,17 @@ import (
 )
 
 type ClientLite struct {
-	ID    string `json:"id"`    // UUID
-	Email string `json:"email"` // 作为 UID/email
+	ID    string `json:"id"`
+	Email string `json:"email"`
 }
 
 type FetchResult struct {
 	TagsVLESS []string
 	TagsVMESS []string
 	Clients   []ClientLite
-	Raw       []byte // 原始 JSON（标准化后）用于快照
+	Raw       []byte
 }
 
-// Fetch 拉取服务端数据；兼容两种返回：
-// 1) { "tags": ["t1","t2"], "clients":[...] }           // 旧版（默认当作 vless）
-// 2) { "tags": { "vless":[...], "vmess":[...] }, ... }  // 新版（区分协议）
 func Fetch(apiURL, token, publicID string, timeout time.Duration) (*FetchResult, error) {
 	body, _ := json.Marshal(map[string]string{
 		"token":     token,
@@ -39,8 +36,9 @@ func Fetch(apiURL, token, publicID string, timeout time.Duration) (*FetchResult,
 
 	c := &http.Client{
 		Timeout: timeout,
-		// 避免 POST 被 302 改成 GET，方便排错
-		CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse },
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
 	}
 	resp, err := c.Do(req)
 	if err != nil {
@@ -48,38 +46,44 @@ func Fetch(apiURL, token, publicID string, timeout time.Duration) (*FetchResult,
 	}
 	defer resp.Body.Close()
 
-	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 最多 1MB
 	if resp.StatusCode/100 != 2 {
-		return nil, fmt.Errorf("remote status=%s; body=%.200q", resp.Status, b)
+		preview, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		return nil, fmt.Errorf("remote status=%s; body=%.200q", resp.Status, preview)
 	}
-	// 容忍部分服务没设置正确 Content-Type，这里不强校验
 
-	// 先解成通用结构
+	// 2xx：读完整体（不要限 1MB，避免大 JSON 被截断）
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read body failed: %v", err)
+	}
+
 	var envelope struct {
-		Tags    json.RawMessage   `json:"tags"`
-		Clients []ClientLite      `json:"clients"`
+		Tags    json.RawMessage `json:"tags"`
+		Clients []ClientLite    `json:"clients"`
 	}
 	if err := json.Unmarshal(b, &envelope); err != nil {
-		return nil, fmt.Errorf("decode json failed: %v; body=%.200q", err, b)
+		// 报错时也给一点正文预览，便于排查
+		preview := string(b)
+		if len(preview) > 200 {
+			preview = preview[:200]
+		}
+		return nil, fmt.Errorf("decode json failed: %v; body=%.200q", err, preview)
 	}
 
 	var tagsVLESS, tagsVMESS []string
 
-	// tags 可能是数组或对象
+	// tags 可能是数组（旧格式）或对象（新格式）
 	var arr []string
 	if len(envelope.Tags) > 0 && json.Unmarshal(envelope.Tags, &arr) == nil {
-		// 老格式：数组，默认归到 vless
 		tagsVLESS = nonEmpty(arr)
 	} else {
 		var obj map[string][]string
 		if len(envelope.Tags) > 0 && json.Unmarshal(envelope.Tags, &obj) == nil {
-			// 新格式：对象
 			tagsVLESS = nonEmpty(append(obj["vless"], obj["VLESS"]...))
 			tagsVMESS = nonEmpty(append(obj["vmess"], obj["VMESS"]...))
 		}
 	}
 
-	// 标准化一份原始快照
 	raw, _ := json.Marshal(struct {
 		Tags struct {
 			VLESS []string `json:"vless,omitempty"`
