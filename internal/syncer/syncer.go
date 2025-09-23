@@ -13,6 +13,9 @@ import (
 
 	"github.com/zionnode/xray-admin/internal/store"
 	"github.com/zionnode/xray-admin/internal/xray"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type Summary struct {
@@ -22,37 +25,41 @@ type Summary struct {
 	Failed  int `json:"failed"`
 }
 
-// Sync 把 target 用户集声明式同步到 Xray（按 email=UID 为键）；成功后更新本地 DB 与快照。
-// 与旧版不同：同步过程中仅更新内存态 state，完毕后一次性 db.ReplaceAll(state) 落盘。
-// concurrency 为并发 worker 数；mode: "replace"（含删除）或 "upsert"（不删）。
+// reseed: 若为 true，则对 target 中的所有用户执行一次 Add（已存在则跳过），用于自愈 Xray 丢失的内存态用户。
 func Sync(apiAddr string, tags []string, target map[string]store.User, mode string,
-	concurrency int, db *store.DB, snapDir string, rawJSON []byte) (Summary, error) {
+	concurrency int, reseed bool, db *store.DB, snapDir string, rawJSON []byte) (Summary, error) {
 
-	if strings.TrimSpace(mode) == "" {
-		mode = "replace"
-	}
-	if concurrency <= 0 {
-		concurrency = 1
-	}
+	if strings.TrimSpace(mode) == "" { mode = "replace" }
+	if concurrency <= 0 { concurrency = 1 }
 	_ = os.MkdirAll(snapDir, 0o755)
 	currentJSON := filepath.Join(snapDir, "current.json")
 
-	// 1) 计算差异
+	// 1) 差异
 	prev := db.Snapshot()
 	adds, upds, dels := diff(prev, target, mode)
 
+	// reseed：把 adds 改成“所有 target（去掉需要 update 的）”
+	if reseed {
+		// 先做一个需要 update 的 UID 集合
+		updSet := map[string]struct{}{}
+		for _, p := range upds { updSet[p.new.UID] = struct{}{} }
+		adds = adds[:0]
+		for uid, u := range target {
+			if _, isUpd := updSet[uid]; isUpd {
+				continue // 这类用 upd 处理（删后加），避免和 add 冲突
+			}
+			adds = append(adds, u)
+		}
+	}
+
 	// 2) 连接 Xray
 	cli, err := xray.NewClient(apiAddr, tags, 8*time.Second)
-	if err != nil {
-		return Summary{}, err
-	}
+	if err != nil { return Summary{}, err }
 	defer cli.Close()
 
-	// 3) 准备“工作副本” state（内存态），成功的变更只改 state；最后一次性写盘
+	// 3) 内存态 state，最后一次性落盘
 	state := make(map[string]store.User, len(prev))
-	for k, v := range prev {
-		state[k] = v
-	}
+	for k, v := range prev { state[k] = v }
 	var stateMu sync.Mutex
 
 	// 4) 并发执行
@@ -67,14 +74,11 @@ func Sync(apiAddr string, tags []string, target map[string]store.User, mode stri
 	totalJobs := len(adds) + len(upds) + len(dels)
 	var processed, okAdd, okUpd, okDel, failed int64
 
-	// 进度：每秒打印一次 & 每 100 条里程碑
+	// 进度：每秒 + 每 100 条里程碑
 	stopProg := make(chan struct{})
 	go func() {
-		if totalJobs == 0 {
-			return
-		}
-		tk := time.NewTicker(1 * time.Second)
-		defer tk.Stop()
+		if totalJobs == 0 { return }
+		tk := time.NewTicker(1 * time.Second); defer tk.Stop()
 		for {
 			select {
 			case <-tk.C:
@@ -97,38 +101,30 @@ func Sync(apiAddr string, tags []string, target map[string]store.User, mode stri
 			var e error
 			switch j.typ {
 			case "add":
-				e = withRetry(3, func() error { return addUser(cli, j.u) })
-				if e == nil {
-					stateMu.Lock()
-					state[j.u.UID] = j.u
-					stateMu.Unlock()
-					atomic.AddInt64(&okAdd, 1)
+				created, err := ensureAdd(cli, j.u)
+				e = err
+				if err == nil {
+					// 成功（创建或已存在）都把 state 收敛到目标
+					stateMu.Lock(); state[j.u.UID] = j.u; stateMu.Unlock()
+					if created { atomic.AddInt64(&okAdd, 1) } else { atomic.AddInt64(&okAdd, 1) } // 计入 added 统计
 				}
 			case "upd":
 				e = withRetry(3, func() error {
-					if err := cli.Remove(j.old.Email); err != nil {
-						return err
-					}
+					if err := cli.Remove(j.old.Email); err != nil { return err }
 					return addUser(cli, j.new)
 				})
 				if e == nil {
-					stateMu.Lock()
-					state[j.new.UID] = j.new
-					stateMu.Unlock()
+					stateMu.Lock(); state[j.new.UID] = j.new; stateMu.Unlock()
 					atomic.AddInt64(&okUpd, 1)
 				}
 			case "del":
 				e = withRetry(3, func() error { return cli.Remove(j.u.Email) })
 				if e == nil {
-					stateMu.Lock()
-					delete(state, j.u.UID)
-					stateMu.Unlock()
+					stateMu.Lock(); delete(state, j.u.UID); stateMu.Unlock()
 					atomic.AddInt64(&okDel, 1)
 				}
 			}
-			if e != nil {
-				atomic.AddInt64(&failed, 1)
-			}
+			if e != nil { atomic.AddInt64(&failed, 1) }
 
 			n := atomic.AddInt64(&processed, 1)
 			if totalJobs > 0 && n%100 == 0 {
@@ -143,15 +139,13 @@ func Sync(apiAddr string, tags []string, target map[string]store.User, mode stri
 		wg.Done()
 	}
 
-	// 起 worker
 	if totalJobs > 0 {
 		for i := 0; i < concurrency; i++ {
-			wg.Add(1)
-			go worker(i + 1)
+			wg.Add(1); go worker(i+1)
 		}
 	}
 
-	// 投喂任务：先 add、再 upd（删后加）、最后 del
+	// 投喂任务：add → upd → del
 	for _, u := range adds {
 		jobs <- job{typ: "add", u: u}
 	}
@@ -168,12 +162,12 @@ func Sync(apiAddr string, tags []string, target map[string]store.User, mode stri
 	wg.Wait()
 	close(stopProg)
 
-	// 5) 一次性落盘（用最终 state 替换整库）
+	// 5) 一次性落盘
 	if err := db.ReplaceAll(state); err != nil {
 		log.Printf("warning: write users.json failed: %v", err)
 	}
 
-	// 6) 写快照（原始输入）
+	// 6) 写快照
 	now := time.Now().Unix()
 	wrap := map[string]any{"revision": now, "payload": json.RawMessage(rawJSON)}
 	b, _ := json.MarshalIndent(wrap, "", "  ")
@@ -228,12 +222,22 @@ func addUser(cli *xray.Client, u store.User) error {
 	}
 }
 
+// ensureAdd: 成功新增返回 (true, nil)；已存在返回 (false, nil)；其它错误返回 (false, err)
+func ensureAdd(cli *xray.Client, u store.User) (bool, error) {
+	err := addUser(cli, u)
+	if err == nil {
+		return true, nil // 新增
+	}
+	if st, ok := status.FromError(err); ok && st.Code() == codes.AlreadyExists {
+		return false, nil // 已存在，当成功处理
+	}
+	return false, err
+}
+
 func withRetry(n int, f func() error) error {
 	var err error
 	for i := 0; i < n; i++ {
-		if err = f(); err == nil {
-			return nil
-		}
+		if err = f(); err == nil { return nil }
 		time.Sleep(time.Duration(200*(i+1)) * time.Millisecond)
 	}
 	return err
