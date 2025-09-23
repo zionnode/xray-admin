@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -18,98 +19,105 @@ func main() {
 	token    := flag.String("token", "", "固定鉴权 token（必填）")
 	publicID := flag.String("public-id", "", "该 Xray 服务器的 public_id（必填）")
 
-	// Xray gRPC 与用户默认属性
-	xrayAddr     := flag.String("xray", "127.0.0.1:1090", "Xray gRPC 地址（host:port）")
-	defaultProto := flag.String("proto", "vless", "默认协议：vless | vmess")
-	defaultLevel := flag.Uint("level", 1, "默认 level（建议 1）")
-	defaultFlow  := flag.String("flow", "", "默认 VLESS flow（普通 VLESS 请留空；Vision 用 xtls-rprx-vision）")
+	// Xray gRPC 与默认
+	xrayAddr := flag.String("xray", "127.0.0.1:1090", "Xray gRPC 地址（host:port）")
+	defLevel := flag.Uint("level", 1, "默认 level（建议 1）")
+	defFlow  := flag.String("flow", "", "默认 VLESS flow（普通 VLESS 留空；Vision 用 xtls-rprx-vision）")
 
-	// 同步模式与本地存储
+	// 同步模式与存储
 	mode    := flag.String("mode", "replace", "同步模式：replace | upsert（replace 会删除目标外的用户）")
-	dbPath  := flag.String("db", "data/users.json", "本地清单 DB 路径（JSON）")
+	dbPath  := flag.String("db", "data/users.json", "本地清单 DB 路径（基名；会自动拆分为 .vless/.vmess）")
 	snapDir := flag.String("snap", "data/snapshots", "快照目录（保存远端原始 JSON）")
 
 	// 运行控制
 	interval    := flag.Duration("interval", 0, "轮询间隔（>0 则循环同步，如 1m）")
-	concurrency := flag.Int("concurrency", 64, "并发 worker 数（Add/Update/Delete），建议大机型 128~192，小机型 4~16")
-	reseed      := flag.Bool("reseed", false, "自愈模式：对所有目标用户执行 Add（已存在则跳过），修复 Xray 内存态丢失")
-
-	// 覆盖远端 tags（可选）
-	overrideTags := flag.String("tags", "", "用逗号分隔的 inbound tags（若设置则覆盖远端返回的 tags）")
+	concurrency := flag.Int("concurrency", 64, "并发 worker 数（Add/Update/Delete）")
+	reseed      := flag.Bool("reseed", false, "自愈模式：对目标集合执行 Add（已存在跳过），修复 Xray 内存态丢失")
 
 	flag.Parse()
-
-	// 基本校验
 	if *token == "" || *publicID == "" {
 		log.Fatal("缺少必要参数：-token / -public-id")
 	}
 
-	// 打开本地“权威清单”DB
-	db, err := store.Open(*dbPath)
-	if err != nil {
-		log.Fatalf("open db: %v", err)
-	}
-
-	splitCSV := func(s string) []string {
-		if strings.TrimSpace(s) == "" {
-			return nil
+	// helper：从基路径派生 .vless/.vmess 两个文件
+	suff := func(base, suffix string) string {
+		if strings.HasSuffix(base, ".json") {
+			return strings.TrimSuffix(base, ".json") + "." + suffix + ".json"
 		}
-		parts := strings.Split(s, ",")
-		var out []string
-		for _, p := range parts {
-			if q := strings.TrimSpace(p); q != "" {
-				out = append(out, q)
+		return base + "." + suffix + ".json"
+	}
+	dbPathV := suff(*dbPath, "vless")
+	dbPathM := suff(*dbPath, "vmess")
+
+	// 打开两个 DB（分别记录两套权威清单，互不覆盖）
+	dbV, err := store.Open(dbPathV)
+	if err != nil { log.Fatalf("open db vless: %v", err) }
+	dbM, err := store.Open(dbPathM)
+	if err != nil { log.Fatalf("open db vmess: %v", err) }
+
+	buildUsers := func(clients []remote.ClientLite, proto string) map[string]store.User {
+		out := make(map[string]store.User, len(clients))
+		for _, c := range clients {
+			if c.Email == "" || c.ID == "" { continue }
+			u := store.User{
+				UID:   c.Email,
+				Email: c.Email,
+				UUID:  c.ID,
+				Proto: proto,
+				Level: uint32(*defLevel),
+				Flow:  "",
 			}
+			if proto == "vless" {
+				u.Flow = *defFlow // 仅 vless 有 flow 概念
+			}
+			out[c.Email] = u
 		}
 		return out
 	}
 
 	runOnce := func() {
 		log.Printf("fetching %s ...", *apiURL)
-		res, err := remote.Fetch(
-			*apiURL,
-			*token,
-			*publicID,
-			*defaultProto,
-			uint32(*defaultLevel),
-			*defaultFlow,
-			15*time.Second,
-		)
+		res, err := remote.Fetch(*apiURL, *token, *publicID, 15*time.Second)
 		if err != nil {
 			log.Printf("fetch error: %v", err)
 			return
 		}
+		// 快速提示返回了什么 tags
+		log.Printf("remote tags: vless=%v vmess=%v (clients=%d)", res.TagsVLESS, res.TagsVMESS, len(res.Clients))
 
-		// tags 决定：优先使用本地覆盖；否则用远端；二者都没有则跳过
-		useTags := splitCSV(*overrideTags)
-		if len(useTags) == 0 {
-			useTags = res.Tags
-		}
-		if len(useTags) == 0 {
-			log.Printf("no tags provided (neither local -tags nor remote tags). skip this round")
-			return
+		// VLESS 同步
+		if len(res.TagsVLESS) > 0 {
+			usersV := buildUsers(res.Clients, "vless")
+			log.Printf("sync VLESS → Xray(%s), tags=%v, users=%d, mode=%s, concurrency=%d, reseed=%v",
+				*xrayAddr, res.TagsVLESS, len(usersV), *mode, *concurrency, *reseed)
+
+			sum, err := syncer.Sync(*xrayAddr, res.TagsVLESS, usersV, *mode, *concurrency, *reseed, dbV, *snapDir, res.Raw)
+			if err != nil {
+				log.Printf("sync VLESS error: %v", err)
+			} else {
+				log.Printf("SYNC VLESS DONE: added=%d updated=%d removed=%d failed=%d",
+					sum.Added, sum.Updated, sum.Removed, sum.Failed)
+			}
 		}
 
-		log.Printf("sync to Xray(%s) tags=%v users=%d mode=%s concurrency=%d reseed=%v",
-			*xrayAddr, useTags, len(res.Users), *mode, *concurrency, *reseed)
+		// VMess 同步
+		if len(res.TagsVMESS) > 0 {
+			usersM := buildUsers(res.Clients, "vmess")
+			log.Printf("sync VMESS → Xray(%s), tags=%v, users=%d, mode=%s, concurrency=%d, reseed=%v",
+				*xrayAddr, res.TagsVMESS, len(usersM), *mode, *concurrency, *reseed)
 
-		sum, err := syncer.Sync(
-			*xrayAddr,
-			useTags,
-			res.Users,
-			*mode,
-			*concurrency,
-			*reseed,
-			db,
-			*snapDir,
-			res.Raw,
-		)
-		if err != nil {
-			log.Printf("sync error: %v", err)
-			return
+			sum, err := syncer.Sync(*xrayAddr, res.TagsVMESS, usersM, *mode, *concurrency, *reseed, dbM, *snapDir, res.Raw)
+			if err != nil {
+				log.Printf("sync VMESS error: %v", err)
+			} else {
+				log.Printf("SYNC VMESS DONE: added=%d updated=%d removed=%d failed=%d",
+					sum.Added, sum.Updated, sum.Removed, sum.Failed)
+			}
 		}
-		log.Printf("SYNC DONE: added=%d updated=%d removed=%d failed=%d",
-			sum.Added, sum.Updated, sum.Removed, sum.Failed)
+
+		if len(res.TagsVLESS) == 0 && len(res.TagsVMESS) == 0 {
+			log.Printf("no tags in remote response; nothing to do")
+		}
 	}
 
 	// 先跑一次
@@ -124,5 +132,5 @@ func main() {
 		}
 	}
 
-	fmt.Println("OK")
+	fmt.Println("OK (snapshots →", filepath.Clean(*snapDir)+")")
 }
