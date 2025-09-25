@@ -85,18 +85,24 @@ func (c *Client) Remove(email string) error {
 // --- 内部辅助 ---
 
 func (c *Client) addUserAll(u *protocol.User) error {
-	op := &command.AddUserOperation{User: u}
-	typed := serial.ToTypedMessage(op)
-	for _, tag := range c.Tags {
-		if err := c.alter(tag, typed); err != nil {
-			// 已存在则忽略继续
-			if alreadyExists(err) {
-				continue
-			}
-			return fmt.Errorf("tag=%s: %w", tag, err)
-		}
-	}
-	return nil
+    ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+    defer cancel()
+
+    var errs []string
+    for _, tag := range c.tags {
+        _, err := c.api.AlterInbound(ctx, &command.AlterInboundRequest{
+            Tag:       tag,
+            Operation: serial.ToTypedMessage(&command.AddUserOperation{User: u}),
+        })
+        if err != nil {
+            st, _ := status.FromError(err)
+            errs = append(errs, fmt.Sprintf("tag=%s code=%s err=%v", tag, st.Code(), err))
+        }
+    }
+    if len(errs) > 0 {
+        return fmt.Errorf(strings.Join(errs, "; "))
+    }
+    return nil
 }
 
 func (c *Client) alter(tag string, op *serial.TypedMessage) error {

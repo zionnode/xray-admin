@@ -124,7 +124,17 @@ func Sync(apiAddr string, tags []string, target map[string]store.User, mode stri
 					atomic.AddInt64(&okDel, 1)
 				}
 			}
-			if e != nil { atomic.AddInt64(&failed, 1) }
+			if e != nil {
+				atomic.AddInt64(&failed, 1)
+				// gRPC 码与消息
+				if st, ok := status.FromError(e); ok {
+					log.Printf("FAIL op=%s proto=%s uid=%s email=%s code=%s msg=%q",
+						j.typ, j.u.Proto, j.u.UID, j.u.Email, st.Code(), st.Message())
+				} else {
+					log.Printf("FAIL op=%s proto=%s uid=%s email=%s err=%v",
+						j.typ, j.u.Proto, j.u.UID, j.u.Email, e)
+				}
+			}
 
 			n := atomic.AddInt64(&processed, 1)
 			if totalJobs > 0 && n%100 == 0 {
