@@ -1,7 +1,6 @@
 package syncer
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -18,237 +17,312 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+// Summary 用于最终统计输出
 type Summary struct {
-	Added   int `json:"added"`
-	Updated int `json:"updated"`
-	Removed int `json:"removed"`
-	Failed  int `json:"failed"`
+	Added, Updated, Removed, Failed int64
+
+	// 幂等统计（不算入 Added/Removed/Failed）：
+	SkipAddExist   int64 // add 时 already exists
+	SkipDelMissing int64 // del/upd-remove 时 not found
 }
 
-// reseed: 若为 true，则对 target 中的所有用户执行一次 Add（已存在则跳过），用于自愈 Xray 丢失的内存态用户。
-func Sync(apiAddr string, tags []string, target map[string]store.User, mode string,
-	concurrency int, reseed bool, db *store.DB, snapDir string, rawJSON []byte) (Summary, error) {
+// Sync
+// - xrayAddr: gRPC 地址（host:port）
+// - tags:     目标 inbound tag 列表（本次只对这些 tag 同步）
+// - users:    远端“权威清单”，key=UID（email），value=User
+// - mode:     "replace" | "upsert"
+// - concurrency: worker 并发
+// - reseed:   true 时对 users 中所有用户执行一次 Add（已存在跳过），不做删除
+// - idemMode: "skip"(默认) | "success" | "fail" —— 幂等情况的计数策略
+// - db:       本地 DB（保存权威清单）
+// - snapDir/raw: 保存原始快照
+func Sync(xrayAddr string, tags []string, users map[string]store.User,
+	mode string, concurrency int, reseed bool,
+	idemMode string,
+	db *store.DB, snapDir string, raw []byte,
+) (*Summary, error) {
 
-	if strings.TrimSpace(mode) == "" { mode = "replace" }
-	if concurrency <= 0 { concurrency = 1 }
-	_ = os.MkdirAll(snapDir, 0o755)
-	currentJSON := filepath.Join(snapDir, "current.json")
+	sum := &Summary{}
 
-	// 1) 差异
-	prev := db.Snapshot()
-	adds, upds, dels := diff(prev, target, mode)
-
-	// reseed：把 adds 改成“所有 target（去掉需要 update 的）”
-	if reseed {
-		// 先做一个需要 update 的 UID 集合
-		updSet := map[string]struct{}{}
-		for _, p := range upds { updSet[p.new.UID] = struct{}{} }
-		adds = adds[:0]
-		for uid, u := range target {
-			if _, isUpd := updSet[uid]; isUpd {
-				continue // 这类用 upd 处理（删后加），避免和 add 冲突
-			}
-			adds = append(adds, u)
+	// 1) 快照落盘（尽量不影响主流程，失败仅告警）
+	if len(raw) > 0 && snapDir != "" {
+		_ = os.MkdirAll(snapDir, 0o755)
+		fn := filepath.Join(snapDir, time.Now().Format("20060102-150405")+".json")
+		if err := os.WriteFile(fn, raw, 0o644); err != nil {
+			log.Printf("warn: write snapshot failed: %v", err)
 		}
 	}
 
-	// 2) 连接 Xray
-	cli, err := xray.NewClient(apiAddr, tags, 8*time.Second)
-	if err != nil { return Summary{}, err }
+	// 2) 打开 Xray 客户端
+	if len(tags) == 0 {
+		log.Printf("no tags to sync, skip")
+		return sum, nil
+	}
+	cli, err := xray.NewClient(xrayAddr, tags, 15*time.Second)
+	if err != nil {
+		return sum, fmt.Errorf("dial xray %s failed: %w", xrayAddr, err)
+	}
 	defer cli.Close()
 
-	// 3) 内存态 state，最后一次性落盘
-	state := make(map[string]store.User, len(prev))
-	for k, v := range prev { state[k] = v }
-	var stateMu sync.Mutex
-
-	// 4) 并发执行
-	type job struct {
-		typ string       // "add" | "upd" | "del"
-		u   store.User   // add/del
-		old store.User   // upd: 旧
-		new store.User   // upd: 新
+	// 3) 读取本地权威清单
+	have, err := db.Load()
+	if err != nil {
+		return sum, fmt.Errorf("db load failed: %w", err)
 	}
-	jobs := make(chan job, concurrency*2)
+
+	// 4) 计算差异
+	adds, upds, dels := plan(have, users, mode, reseed)
 
 	totalJobs := len(adds) + len(upds) + len(dels)
-	var processed, okAdd, okUpd, okDel, failed int64
-
-	// 进度：每秒 + 每 100 条里程碑
-	stopProg := make(chan struct{})
-	go func() {
-		if totalJobs == 0 { return }
-		tk := time.NewTicker(1 * time.Second); defer tk.Stop()
-		for {
-			select {
-			case <-tk.C:
-				p := atomic.LoadInt64(&processed)
-				a := atomic.LoadInt64(&okAdd)
-				u := atomic.LoadInt64(&okUpd)
-				d := atomic.LoadInt64(&okDel)
-				f := atomic.LoadInt64(&failed)
-				log.Printf("progress: %d/%d (%.1f%%) added=%d updated=%d removed=%d failed=%d",
-					p, totalJobs, 100*float64(p)/float64(totalJobs), a, u, d, f)
-			case <-stopProg:
-				return
-			}
+	if totalJobs == 0 {
+		log.Printf("nothing to do (adds=0 upds=0 dels=0)")
+		// 仍然写回“最新权威清单”
+		if err := db.Save(users); err != nil {
+			log.Printf("warn: db save failed: %v", err)
 		}
-	}()
+		return sum, nil
+	}
 
+	log.Printf("plan: adds=%d upds=%d dels=%d (mode=%s reseed=%v)", len(adds), len(upds), len(dels), mode, reseed)
+
+	// 5) 并发执行
+	type job struct {
+		typ string     // "add" | "del" | "upd"
+		u   store.User // upd 也要带上用户，便于日志/分类
+	}
+
+	jobCh := make(chan job, totalJobs)
 	var wg sync.WaitGroup
-	worker := func(id int) {
-		for j := range jobs {
-			var e error
+	var done int64
+
+	// 幂等识别 + 计数
+	recordFail := func(op string, u store.User, err error) {
+		atomic.AddInt64(&sum.Failed, 1)
+		// 尽力打印出 gRPC code
+		if st, ok := status.FromError(err); ok {
+			log.Printf("FAIL op=%s proto=%s uid=%s email=%s code=%s msg=%q",
+				op, u.Proto, u.UID, u.Email, st.Code(), st.Message())
+		} else {
+			log.Printf("FAIL op=%s proto=%s uid=%s email=%s err=%v",
+				op, u.Proto, u.UID, u.Email, err)
+		}
+	}
+
+	handleIdempotent := func(kind string, u store.User, err error) bool {
+		// 返回 true 表示“此错误已处理完毕（按 skip/success 策略计数），外层无需再按失败处理”
+		if err == nil {
+			return false
+		}
+		if kind == "add" && isAlreadyExists(err) {
+			switch idemMode {
+			case "skip":
+				atomic.AddInt64(&sum.SkipAddExist, 1)
+				log.Printf("SKIP op=add proto=%s uid=%s email=%s reason=already_exists", u.Proto, u.UID, u.Email)
+				return true
+			case "success":
+				atomic.AddInt64(&sum.Added, 1)
+				log.Printf("OK(op=add-exist) proto=%s uid=%s email=%s", u.Proto, u.UID, u.Email)
+				return true
+			}
+			// "fail": 继续外层失败计数
+		}
+		if (kind == "del" || kind == "upd-remove") && isNotFound(err) {
+			switch idemMode {
+			case "skip":
+				atomic.AddInt64(&sum.SkipDelMissing, 1)
+				log.Printf("SKIP op=%s proto=%s uid=%s email=%s reason=not_found", kind, u.Proto, u.UID, u.Email)
+				return true
+			case "success":
+				atomic.AddInt64(&sum.Removed, 1)
+				log.Printf("OK(op=%s-miss) proto=%s uid=%s email=%s", kind, u.Proto, u.UID, u.Email)
+				return true
+			}
+			// "fail": 继续外层失败计数
+		}
+		return false
+	}
+
+	worker := func() {
+		defer wg.Done()
+		for j := range jobCh {
 			switch j.typ {
 			case "add":
-				created, err := ensureAdd(cli, j.u)
-				e = err
-				if err == nil {
-					// 成功（创建或已存在）都把 state 收敛到目标
-					stateMu.Lock(); state[j.u.UID] = j.u; stateMu.Unlock()
-					if created { atomic.AddInt64(&okAdd, 1) } else { atomic.AddInt64(&okAdd, 1) } // 计入 added 统计
-				}
-			case "upd":
-				e = withRetry(3, func() error {
-					if err := cli.Remove(j.old.Email); err != nil { return err }
-					return addUser(cli, j.new)
-				})
-				if e == nil {
-					stateMu.Lock(); state[j.new.UID] = j.new; stateMu.Unlock()
-					atomic.AddInt64(&okUpd, 1)
-				}
-			case "del":
-				e = withRetry(3, func() error { return cli.Remove(j.u.Email) })
-				if e == nil {
-					stateMu.Lock(); delete(state, j.u.UID); stateMu.Unlock()
-					atomic.AddInt64(&okDel, 1)
-				}
-			}
-			if e != nil {
-				atomic.AddInt64(&failed, 1)
-				// gRPC 码与消息
-				if st, ok := status.FromError(e); ok {
-					log.Printf("FAIL op=%s proto=%s uid=%s email=%s code=%s msg=%q",
-						j.typ, j.u.Proto, j.u.UID, j.u.Email, st.Code(), st.Message())
+				var err error
+				if j.u.Proto == "vless" {
+					err = cli.AddVLESS(j.u.Email, j.u.UUID, j.u.Level, j.u.Flow)
 				} else {
-					log.Printf("FAIL op=%s proto=%s uid=%s email=%s err=%v",
-						j.typ, j.u.Proto, j.u.UID, j.u.Email, e)
+					err = cli.AddVMess(j.u.Email, j.u.UUID, j.u.Level)
+				}
+				if err != nil {
+					if !handleIdempotent("add", j.u, err) {
+						recordFail("add", j.u, err)
+					}
+				} else {
+					atomic.AddInt64(&sum.Added, 1)
+				}
+
+			case "del":
+				if err := cli.Remove(j.u.Email); err != nil {
+					if !handleIdempotent("del", j.u, err) {
+						recordFail("del", j.u, err)
+					}
+				} else {
+					atomic.AddInt64(&sum.Removed, 1)
+				}
+
+			case "upd":
+				// 先删后加（两步各自应用幂等策略）
+				if err := cli.Remove(j.u.Email); err != nil {
+					if !handleIdempotent("upd-remove", j.u, err) {
+						recordFail("upd-remove", j.u, err)
+					}
+				} else {
+					atomic.AddInt64(&sum.Removed, 1)
+				}
+				var err2 error
+				if j.u.Proto == "vless" {
+					err2 = cli.AddVLESS(j.u.Email, j.u.UUID, j.u.Level, j.u.Flow)
+				} else {
+					err2 = cli.AddVMess(j.u.Email, j.u.UUID, j.u.Level)
+				}
+				if err2 != nil {
+					if !handleIdempotent("upd-add", j.u, err2) {
+						recordFail("upd-add", j.u, err2)
+					}
+				} else {
+					atomic.AddInt64(&sum.Added, 1)
+					atomic.AddInt64(&sum.Updated, 1)
 				}
 			}
 
-			n := atomic.AddInt64(&processed, 1)
-			if totalJobs > 0 && n%100 == 0 {
-				a := atomic.LoadInt64(&okAdd)
-				u := atomic.LoadInt64(&okUpd)
-				d := atomic.LoadInt64(&okDel)
-				f := atomic.LoadInt64(&failed)
+			// 进度日志
+			cur := atomic.AddInt64(&done, 1)
+			if cur == int64(totalJobs) || cur%200 == 0 {
+				perc := float64(cur) * 100 / float64(totalJobs)
 				log.Printf("progress: %d/%d (%.1f%%) added=%d updated=%d removed=%d failed=%d",
-					n, totalJobs, 100*float64(n)/float64(totalJobs), a, u, d, f)
+					cur, totalJobs, perc,
+					sum.Added, sum.Updated, sum.Removed, sum.Failed)
 			}
 		}
-		wg.Done()
 	}
 
-	if totalJobs > 0 {
-		for i := 0; i < concurrency; i++ {
-			wg.Add(1); go worker(i+1)
-		}
+	if concurrency <= 0 {
+		concurrency = 1
+	}
+	wg.Add(concurrency)
+	for i := 0; i < concurrency; i++ {
+		go worker()
 	}
 
-	// 投喂任务：add → upd → del
+	// 投递任务（顺序无要求）
 	for _, u := range adds {
-		jobs <- job{typ: "add", u: u}
+		jobCh <- job{typ: "add", u: u}
 	}
-	for _, p := range upds {
-		jobs <- job{typ: "upd", old: p.old, new: p.new}
+	for _, u := range upds {
+		jobCh <- job{typ: "upd", u: u}
 	}
-	if strings.EqualFold(mode, "replace") {
-		for _, u := range dels {
-			jobs <- job{typ: "del", u: u}
-		}
+	for _, u := range dels {
+		jobCh <- job{typ: "del", u: u}
 	}
-	close(jobs)
 
+	close(jobCh)
 	wg.Wait()
-	close(stopProg)
 
-	// 5) 一次性落盘
-	if err := db.ReplaceAll(state); err != nil {
-		log.Printf("warning: write users.json failed: %v", err)
+	// 6) 写回最新权威清单
+	if err := db.Save(users); err != nil {
+		log.Printf("warn: db save failed: %v", err)
 	}
 
-	// 6) 写快照
-	now := time.Now().Unix()
-	wrap := map[string]any{"revision": now, "payload": json.RawMessage(rawJSON)}
-	b, _ := json.MarshalIndent(wrap, "", "  ")
-	_ = os.WriteFile(currentJSON, b, 0644)
-	ts := time.Unix(now, 0).UTC().Format("20060102T150405Z")
-	_ = os.WriteFile(filepath.Join(snapDir, fmt.Sprintf("snapshot-%s.json", ts)), rawJSON, 0644)
-
-	sum := Summary{
-		Added:   int(atomic.LoadInt64(&okAdd)),
-		Updated: int(atomic.LoadInt64(&okUpd)),
-		Removed: int(atomic.LoadInt64(&okDel)),
-		Failed:  int(atomic.LoadInt64(&failed)),
-	}
-	log.Printf("SYNC SUMMARY: added=%d updated=%d removed=%d failed=%d (total=%d)",
-		sum.Added, sum.Updated, sum.Removed, sum.Failed, totalJobs)
+	total := int64(totalJobs)
+	log.Printf("SYNC SUMMARY: added=%d updated=%d removed=%d failed=%d skipped=%d (add-exist=%d, del-miss=%d) total=%d",
+		sum.Added, sum.Updated, sum.Removed, sum.Failed,
+		sum.SkipAddExist+sum.SkipDelMissing,
+		sum.SkipAddExist, sum.SkipDelMissing,
+		total,
+	)
 
 	return sum, nil
 }
 
-type updatePair struct{ old, new store.User }
+// ---------- 内部工具 ----------
 
-func diff(prev, target map[string]store.User, mode string) (adds []store.User, upds []updatePair, dels []store.User) {
-	for uid, nu := range target {
-		if ou, ok := prev[uid]; !ok {
-			adds = append(adds, nu)
-		} else if changed(ou, nu) {
-			upds = append(upds, updatePair{old: ou, new: nu})
+// 计算差异集
+func plan(have, want map[string]store.User, mode string, reseed bool) (adds, upds, dels []store.User) {
+	if reseed {
+		// 只做“全量 Add”（已存在由上层幂等策略处理）
+		adds = make([]store.User, 0, len(want))
+		for _, u := range want {
+			adds = append(adds, u)
+		}
+		return
+	}
+
+	// want 中有而 have 没有 → add
+	// 都有但字段变了 → upd
+	for uid, wu := range want {
+		if hu, ok := have[uid]; !ok {
+			adds = append(adds, wu)
+		} else if !userEqual(hu, wu) {
+			upds = append(upds, wu)
 		}
 	}
+
+	// replace 才删除：have 中有而 want 没有 → del
 	if strings.EqualFold(mode, "replace") {
-		for uid, ou := range prev {
-			if _, ok := target[uid]; !ok {
-				dels = append(dels, ou)
+		for uid, hu := range have {
+			if _, ok := want[uid]; !ok {
+				dels = append(dels, hu)
 			}
 		}
 	}
 	return
 }
 
-func changed(a, b store.User) bool {
-	return a.UUID != b.UUID || a.Proto != b.Proto || a.Level != b.Level || a.Flow != b.Flow
-}
-
-func addUser(cli *xray.Client, u store.User) error {
-	switch u.Proto {
-	case "vless":
-		return cli.AddVLESS(u.Email, u.UUID, u.Level, u.Flow)
-	case "vmess":
-		return cli.AddVMess(u.Email, u.UUID, u.Level)
-	default:
-		return fmt.Errorf("unsupported proto: %s", u.Proto)
+// 判断两个用户是否等价（用于是否需要 upd）
+func userEqual(a, b store.User) bool {
+	if a.Proto != b.Proto {
+		return false
 	}
+	if a.UUID != b.UUID || a.Level != b.Level {
+		return false
+	}
+	// VLESS 的 flow 也要比对（VMess 忽略）
+	if a.Proto == "vless" && strings.TrimSpace(a.Flow) != strings.TrimSpace(b.Flow) {
+		return false
+	}
+	// Email/UID 做键，通常相同；不作为差异触发字段
+	return true
 }
 
-// ensureAdd: 成功新增返回 (true, nil)；已存在返回 (false, nil)；其它错误返回 (false, err)
-func ensureAdd(cli *xray.Client, u store.User) (bool, error) {
-	err := addUser(cli, u)
+// 幂等识别（不同 Xray 版本可能把 not found/exist 塞在 Unknown 里）
+func isNotFound(err error) bool {
 	if err == nil {
-		return true, nil // 新增
+		return false
 	}
-	if st, ok := status.FromError(err); ok && st.Code() == codes.AlreadyExists {
-		return false, nil // 已存在，当成功处理
+	if st, ok := status.FromError(err); ok {
+		if st.Code() == codes.NotFound {
+			return true
+		}
+		msg := strings.ToLower(st.Message())
+		if strings.Contains(msg, "not found") {
+			return true
+		}
 	}
-	return false, err
+	return strings.Contains(strings.ToLower(err.Error()), "not found")
 }
 
-func withRetry(n int, f func() error) error {
-	var err error
-	for i := 0; i < n; i++ {
-		if err = f(); err == nil { return nil }
-		time.Sleep(time.Duration(200*(i+1)) * time.Millisecond)
+func isAlreadyExists(err error) bool {
+	if err == nil {
+		return false
 	}
-	return err
+	if st, ok := status.FromError(err); ok {
+		if st.Code() == codes.AlreadyExists {
+			return true
+		}
+		msg := strings.ToLower(st.Message())
+		if strings.Contains(msg, "already exists") {
+			return true
+		}
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "already exists")
 }
