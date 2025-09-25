@@ -25,22 +25,27 @@ type Client struct {
 }
 
 func NewClient(addr string, tags []string, timeout time.Duration) (*Client, error) {
-	conn, err := grpc.Dial(
-		addr,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithBlock(),
-		grpc.WithReturnConnectionError(true),
-	)
-	if err != nil {
-		return nil, err
-	}
-	api := command.NewHandlerServiceClient(conn)
-	return &Client{
-		API:     api,
-		Conn:    conn,
-		Tags:    append([]string(nil), tags...),
-		Timeout: timeout,
-	}, nil
+    // 用同一个超时做拨号超时
+    ctx, cancel := context.WithTimeout(context.Background(), timeout)
+    defer cancel()
+
+    conn, err := grpc.DialContext(
+        ctx,
+        addr,
+        grpc.WithTransportCredentials(insecure.NewCredentials()),
+        grpc.WithBlock(),
+        grpc.WithReturnConnectionError(), // ← 不要参数
+    )
+    if err != nil {
+        return nil, err
+    }
+    api := command.NewHandlerServiceClient(conn)
+    return &Client{
+        API:     api,
+        Conn:    conn,
+        Tags:    append([]string(nil), tags...),
+        Timeout: timeout,
+    }, nil
 }
 
 func (c *Client) Close() error {
