@@ -52,6 +52,9 @@ func Sync(apiAddr string, tags []string, target map[string]store.User, mode stri
 		}
 	}
 
+	// 计划统计，便于调试
+	log.Printf("plan: tags=%v add=%d upd=%d del=%d mode=%s reseed=%v", tags, len(adds), len(upds), len(dels), mode, reseed)
+
 	// 2) 连接 Xray
 	cli, err := xray.NewClient(apiAddr, tags, 8*time.Second)
 	if err != nil { return Summary{}, err }
@@ -124,7 +127,29 @@ func Sync(apiAddr string, tags []string, target map[string]store.User, mode stri
 					atomic.AddInt64(&okDel, 1)
 				}
 			}
-			if e != nil { atomic.AddInt64(&failed, 1) }
+			if e != nil {
+				atomic.AddInt64(&failed, 1)
+				// 构造便于排查的关键信息（proto/email/uuid/flow/tags + gRPC code）
+				email := j.u.Email
+				proto := j.u.Proto
+				uuid := j.u.UUID
+				flow := j.u.Flow
+				if j.typ == "upd" {
+					if j.new.Email != "" { email = j.new.Email }
+					if j.new.Proto != "" { proto = j.new.Proto }
+					if j.new.UUID != "" { uuid = j.new.UUID }
+					if j.new.Flow != "" { flow = j.new.Flow }
+				}
+
+				codeName := codes.Unknown.String()
+				msg := e.Error()
+				if st, ok := status.FromError(e); ok {
+					codeName = st.Code().String()
+					msg = st.Message()
+				}
+				log.Printf("FAIL detail: op=%s proto=%s email=%s uuid=%s flow=%s tags=%v code=%s err=%s",
+					j.typ, proto, email, uuid, flow, tags, codeName, msg)
+			}
 
 			n := atomic.AddInt64(&processed, 1)
 			if totalJobs > 0 && n%100 == 0 {
