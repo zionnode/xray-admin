@@ -34,26 +34,23 @@ func Sync(apiAddr string, tags []string, target map[string]store.User, mode stri
 	_ = os.MkdirAll(snapDir, 0o755)
 	currentJSON := filepath.Join(snapDir, "current.json")
 
-	// 1) 差异
+	// 1) 差异（用于删除/替换判定）
 	prev := db.Snapshot()
 	adds, upds, dels := diff(prev, target, mode)
 
-	// reseed：把 adds 改成“所有 target（去掉需要 update 的）”
-	if reseed {
-		// 先做一个需要 update 的 UID 集合
-		updSet := map[string]struct{}{}
-		for _, p := range upds { updSet[p.new.UID] = struct{}{} }
-		adds = adds[:0]
-		for uid, u := range target {
-			if _, isUpd := updSet[uid]; isUpd {
-				continue // 这类用 upd 处理（删后加），避免和 add 冲突
-			}
-			adds = append(adds, u)
-		}
-	}
+	// —— D→A 策略：先删后加 —— 
+	// delList = 需要删除的 + 有变更的旧条目（把“更新”转为删旧+加新）
+	delList := make([]store.User, 0, len(dels)+len(upds))
+	delList = append(delList, dels...)
+	for _, p := range upds { delList = append(delList, p.old) }
 
-	// 计划统计，便于调试
-	log.Printf("plan: tags=%v add=%d upd=%d del=%d mode=%s reseed=%v", tags, len(adds), len(upds), len(dels), mode, reseed)
+	// addAll = 目标态中的“全部用户”；统一一次性 Add，AlreadyExists 视为成功
+	addAll := make([]store.User, 0, len(target))
+	for _, u := range target { addAll = append(addAll, u) }
+
+	// reseed 与 D→A 本质一致（全量 Add），因此无需单独处理；保留参数仅做日志用途
+	log.Printf("plan(D→A): tags=%v del=%d addAll=%d (orig add=%d upd=%d del=%d) mode=%s reseed=%v",
+		tags, len(delList), len(addAll), len(adds), len(upds), len(dels), mode, reseed)
 
 	// 2) 连接 Xray
 	cli, err := xray.NewClient(apiAddr, tags, 8*time.Second)
@@ -74,7 +71,7 @@ func Sync(apiAddr string, tags []string, target map[string]store.User, mode stri
 	}
 	jobs := make(chan job, concurrency*2)
 
-	totalJobs := len(adds) + len(upds) + len(dels)
+	totalJobs := len(delList) + len(addAll)
 	var processed, okAdd, okUpd, okDel, failed int64
 
 	// 进度：每秒 + 每 100 条里程碑
@@ -145,7 +142,16 @@ func Sync(apiAddr string, tags []string, target map[string]store.User, mode stri
 					atomic.AddInt64(&okUpd, 1)
 				}
 			case "del":
-				e = withRetry(3, func() error { return cli.Remove(j.u.Email) })
+				e = withRetry(3, func() error {
+					if err := cli.Remove(j.u.Email); err != nil {
+						lower := strings.ToLower(err.Error())
+						if strings.Contains(lower, "not found") || strings.Contains(lower, "user not found") {
+							return nil
+						}
+						return err
+					}
+					return nil
+				})
 				if e == nil {
 					stateMu.Lock(); delete(state, j.u.UID); stateMu.Unlock()
 					atomic.AddInt64(&okDel, 1)
@@ -194,17 +200,12 @@ func Sync(apiAddr string, tags []string, target map[string]store.User, mode stri
 		}
 	}
 
-	// 投喂任务：add → upd → del
-	for _, u := range adds {
+	// 投喂任务（D→A）：先删（含“有变更的旧条目”），再全量 Add
+	for _, u := range delList {
+		jobs <- job{typ: "del", u: u}
+	}
+	for _, u := range addAll {
 		jobs <- job{typ: "add", u: u}
-	}
-	for _, p := range upds {
-		jobs <- job{typ: "upd", old: p.old, new: p.new}
-	}
-	if strings.EqualFold(mode, "replace") {
-		for _, u := range dels {
-			jobs <- job{typ: "del", u: u}
-		}
 	}
 	close(jobs)
 
