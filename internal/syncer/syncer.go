@@ -113,29 +113,30 @@ func Sync(apiAddr string, tags []string, target map[string]store.User, mode stri
 				}
 			case "upd":
 				e = withRetry(3, func() error {
-					// 1) 先尝试直接新增（如果本就不存在，可一步到位）
-					if _, err := ensureAdd(cli, j.new); err == nil {
-						return nil
-					} else {
-						// 如果报 AlreadyExists，说明确实存在，需要做“替换”；
-						// 其它错误也尝试走一次 remove+add 作为兜底
-						if st, ok := status.FromError(err); ok && st.Code() == codes.AlreadyExists {
-							// fallthrough to remove+add
-						} else {
-							// 继续尝试 remove+add 兜底
+					// 1) Try add first and check if it actually created a new entry.
+					//    If it returned (created=false, nil), the user already exists
+					//    (same email) and we need to replace to reflect a UUID/flow change.
+					created, firstErr := ensureAdd(cli, j.new)
+					if firstErr == nil {
+						if created {
+							// Newly added – done.
+							return nil
 						}
+						// AlreadyExists normalized by ensureAdd (created=false, nil):
+						// proceed to remove+add to refresh UUID/flow.
+					} else {
+						// Non-nil error: still attempt remove+add as a fallback.
 					}
 
-					// 2) 删除旧的（容忍 not found）
+					// 2) Remove old (tolerate "not found").
 					if err := cli.Remove(j.old.Email); err != nil {
 						lower := strings.ToLower(err.Error())
 						if !(strings.Contains(lower, "not found") || strings.Contains(lower, "user not found")) {
-							// 某些 Xray 版本把 not found 也归为 Unknown，这里用文本兜底
 							return err
 						}
 					}
 
-					// 3) 再次新增（用 ensureAdd 容忍 AlreadyExists）
+					// 3) Add again (ensureAdd tolerates AlreadyExists).
 					_, err := ensureAdd(cli, j.new)
 					return err
 				})
